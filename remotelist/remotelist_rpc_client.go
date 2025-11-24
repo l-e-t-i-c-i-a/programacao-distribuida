@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"rpc/remotelist/pkg" // Importa o pacote com as structs Args/Reply
+	"remotelist/pkg" // Importa o pacote com as structs Args/Reply
 	"log"
 	"net/rpc"
 	"time"

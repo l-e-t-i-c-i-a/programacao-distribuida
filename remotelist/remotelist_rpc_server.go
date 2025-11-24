@@ -1,7 +1,7 @@
 package main
 
 import (
-	"rpc/remotelist/pkg"
+	"remotelist/pkg"
 	"log"
 	"net"
 	"net/rpc"
