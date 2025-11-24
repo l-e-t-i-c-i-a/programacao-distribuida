@@ -14,13 +14,14 @@ A principal limitação é que tudo roda em uma única máquina.
 **Disponibilidade**
 O sistema possui um "Ponto Único de Falha" (*Single Point of Failure*).
 * **O Problema:** Se o processo do servidor travar ou a máquina desligar, o serviço fica totalmente fora do ar. Nenhum cliente consegue fazer nada.
-* **A Recuperação:** A boa notícia é que, graças à persistência (Log + Snapshot), os dados estão salvos. Assim que o servidor reiniciar, ele recupera o estado e volta a funcionar. Porém, durante o tempo em que ele estiver desligado, a disponibilidade é zero.
+* **A Recuperação:** A boa notícia é que, graças à persistência robusta, nenhum dado confirmado é perdido. Assim que o servidor reiniciar, ele recupera o estado exato via Log e Snapshot e volta a funcionar. Porém, durante o tempo em que ele estiver desligado, a disponibilidade é zero.
 * **Como melhorar:** A solução seria ter réplicas (cópias do servidor). Se o principal cair, um reserva assume.
 
-**Consistência (Forte, mas com detalhes)**
-Como existe apenas um servidor, a consistência é o ponto forte da solução. Não dá para dois clientes verem estados diferentes da lista ao mesmo tempo. No entanto, há um detalhe técnico importante na forma como os dados estão sendo salvos:
-* **O risco da ordem de gravação:** Atualmente, o sistema altera a memória RAM primeiro e depois grava no log. Existe um risco: se a gravação no disco falhar (ex: disco cheio), o servidor continua rodando com o dado na memória, mas sem ter salvo ele de verdade.
-* **Write-Ahead Log (WAL):** O ideal seria usar uma técnica chamada *Write-Ahead Log*, onde garante-se a escrita no disco *antes* de mexer na memória. Isso é mais seguro, mas deixa o sistema mais lento, pois toda operação teria que esperar o disco confirmar.
+**Consistência**
+Como existe apenas um servidor, a consistência é o ponto forte da solução. Não dá para dois clientes verem estados diferentes da lista ao mesmo tempo.
+* **Atomicidade Garantida:** O sistema segue a regra: "O disco é a verdade". Ao receber uma requisição de escrita, o servidor tenta gravar no arquivo de log antes de alterar a memória RAM.
+* **Proteção contra Falhas:** Se a gravação no disco falhar (disco cheio ou erro de I/O), a operação é abortada e a memória permanece intacta. Isso impede o estado de "dados zumbis" (onde a memória diz que o dado existe, mas o disco não).
+* **Trade-off (O Preço da Segurança):** Essa garantia forte de consistência traz um custo de latência. O cliente precisa esperar o disco confirmar a gravação física (sync) antes de receber o "Sucesso". Optou-se pela segurança dos dados em detrimento da velocidade bruta.
 
 **Conclusão e Trade-offs**
 Para resolver os problemas de escalabilidade e disponibilidade, seria necessário transformar esse sistema em um sistema distribuído com vários nós (vários servidores). Porém, isso traria um novo problema: manter a consistência entre todas as cópias.
