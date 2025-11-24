@@ -13,6 +13,7 @@ import (
 	"time"
 )
 
+// Define nomes dos arquivos usados na persistência e o intervalo entre snapshots
 const (
 	// Arquivos de persistência
 	snapshotFile = "remotelist.snapshot"
@@ -22,8 +23,7 @@ const (
 )
 
 // --- Structs para Argumentos e Respostas RPC ---
-// Usar structs dedicadas torna a API mais clara e extensível
-
+// Cada operação tem seu par de structs Args/Reply.
 type AppendArgs struct {
 	ListID string
 	Value  int
@@ -57,10 +57,11 @@ type SizeReply struct {
 // --- Estruturas de Dados do Servidor ---
 
 // ManagedList encapsula uma única lista e seu próprio mutex.
-// Isso permite o bloqueio refinado: operações em listas diferentes
+// Isso permite o bloqueio refinado: operações em listas diferentes; diferentes listas podem ser acessadas em paralelo
 // (ex: 'listaA' e 'listaB') podem ocorrer em paralelo.
+// Cada lista tem seu próprio mutex
 type ManagedList struct {
-	mu   sync.RWMutex // Protege os dados desta lista específica
+	mu   sync.RWMutex // Protege os dados desta lista específica; mutex de leitura/escrita
 	Data []int
 }
 
@@ -68,13 +69,13 @@ type ManagedList struct {
 // Ela gerencia o mapa de todas as ManagedLists.
 type RemoteList struct {
 	mapMu sync.RWMutex // Protege o map 'lists' (criação/deleção de listas)
-	lists map[string]*ManagedList
+	lists map[string]*ManagedList //guarda todas as listas
 
-	logLock sync.Mutex // Protege o acesso ao arquivo de log
+	logLock sync.Mutex // Protege o acesso ao arquivo de log (apenas 1 escrita por vez)
 	logFile *os.File
 }
 
-// NewRemoteList é o construtor do nosso serviço.
+// NewRemoteList é o construtor do nosso serviço; cria o objeto RemoteList
 // Ele inicializa as estruturas e carrega o estado do disco.
 func NewRemoteList() *RemoteList {
 	rl := &RemoteList{
@@ -106,8 +107,9 @@ func NewRemoteList() *RemoteList {
 
 // Append adiciona um valor ao final da lista 'list_id'.
 // Cria a lista se ela não existir.
+// trava a lista antes de logar para garantir consistência (primeiro altera memória, depois log, para não gravar operação errada)
 func (rl *RemoteList) Append(args AppendArgs, reply *AppendReply) error {
-	ml := rl.getOrCreateList(args.ListID)
+	ml := rl.getOrCreateList(args.ListID) //busca ou cria a lista
 
 	// Bloqueia apenas esta lista específica para escrita
 	ml.mu.Lock()
@@ -136,7 +138,7 @@ func (rl *RemoteList) Get(args GetArgs, reply *GetReply) error {
 	}
 
 	// Bloqueia esta lista para leitura
-	ml.mu.RLock()
+	ml.mu.RLock() //bloqueio de leitura, permite múltiplos clientes acessando a lista simultaneamente
 	defer ml.mu.RUnlock()
 
 	if args.Index < 0 || args.Index >= len(ml.Data) {
@@ -147,7 +149,7 @@ func (rl *RemoteList) Get(args GetArgs, reply *GetReply) error {
 	return nil
 }
 
-// Remove remove e retorna o último elemento da lista 'list_id'.
+// Remove e retorna o último elemento da lista 'list_id'.
 func (rl *RemoteList) Remove(args RemoveArgs, reply *RemoveReply) error {
 	ml, exists := rl.getList(args.ListID)
 	if !exists {
@@ -251,7 +253,7 @@ func (rl *RemoteList) logOperation(op string, listID string, value *int) error {
 	if err != nil {
 		return err
 	}
-	// fsync: Garante que os dados sejam escritos no disco.
+	// sync: Garante que os dados sejam escritos no disco.
 	// É custoso, mas necessário para persistência real.
 	return rl.logFile.Sync()
 }
@@ -289,8 +291,7 @@ func (rl *RemoteList) createSnapshot() error {
     // --- FASE 2: Região Crítica (Cópia e Limpeza do Log) ---
 
     // 1. Bloqueia o Log PRIMEIRO (Write Lock).
-    // Isso é crucial: impede que qualquer Append/Remove escreva no log
-    // enquanto estamos decidindo o ponto de corte.
+    // impede que qualquer Append/Remove escreva no log
     rl.logLock.Lock()
     defer rl.logLock.Unlock()
 
@@ -318,7 +319,7 @@ func (rl *RemoteList) createSnapshot() error {
     }
 
     // 4. PONTO DE CORTE: Truncar o Log.
-    // Fazemos isso AGORA, enquanto as listas ainda estão bloqueadas e copiadas.
+    // Fazer isso AGORA, enquanto as listas ainda estão bloqueadas e copiadas.
     // Garantia: O que está em 'snapshotData' é exatamente o estado "zero" do novo log.
     if err := rl.logFile.Truncate(0); err != nil {
         unlockLists() // Libera as listas antes de retornar erro
@@ -366,7 +367,7 @@ func (rl *RemoteList) createSnapshot() error {
 }
 
 // loadFromDisk restaura o estado do serviço a partir dos arquivos.
-// Primeiro carrega o snapshot, depois aplica os logs.
+// Primeiro carrega o snapshot, abre log, depois aplica operações do log.
 func (rl *RemoteList) loadFromDisk() error {
 	// 1. Carregar o Snapshot (se existir)
 	if err := rl.loadSnapshot(); err != nil {
