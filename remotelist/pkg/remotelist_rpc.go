@@ -2,7 +2,7 @@ package remotelist
 
 import (
 	"bufio"
-	"encoding/gob"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,7 +16,7 @@ import (
 // Define nomes dos arquivos usados na persistência e o intervalo entre snapshots
 const (
 	// Arquivos de persistência
-	snapshotFile = "remotelist.snapshot"
+	snapshotFile = "remotelist.json"
 	logFile      = "remotelist.log"
 	// Intervalo para salvar snapshots (ex: 30 segundos)
 	snapshotInterval = 30 * time.Second
@@ -346,11 +346,12 @@ func (rl *RemoteList) createSnapshot() error {
         return fmt.Errorf("falha ao criar arquivo temp de snapshot: %w", err)
     }
     
-    encoder := gob.NewEncoder(file)
+    encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
     if err := encoder.Encode(snapshotData); err != nil {
         file.Close()
         os.Remove(tempFile) // Limpa o arquivo corrompido/incompleto
-        return fmt.Errorf("falha ao serializar (gob) snapshot: %w", err)
+        return fmt.Errorf("falha ao serializar (json) snapshot: %w", err)
     }
     
     // Fecha o arquivo para garantir flush dos dados no disco
@@ -407,9 +408,9 @@ func (rl *RemoteList) loadSnapshot() error {
 	defer file.Close()
 
 	var snapshotData map[string][]int
-	decoder := gob.NewDecoder(file)
+	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&snapshotData); err != nil {
-		return fmt.Errorf("falha ao decodificar (gob) snapshot: %w", err)
+		return fmt.Errorf("falha ao decodificar (json) snapshot: %w", err)
 	}
 
 	// Converte os dados carregados para a estrutura de memória (ManagedList)
