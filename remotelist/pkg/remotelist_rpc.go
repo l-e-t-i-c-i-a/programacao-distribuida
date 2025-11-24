@@ -99,7 +99,7 @@ func NewRemoteList() *RemoteList {
 	// Inicia a goroutine de background para salvar snapshots
 	go rl.snapshotScheduler()
 
-	log.Println("Serviço RemoteList iniciado e pronto.")
+	log.Println("Serviço RemoteList iniciado.")
 	return rl
 }
 
@@ -107,24 +107,25 @@ func NewRemoteList() *RemoteList {
 
 // Append adiciona um valor ao final da lista 'list_id'.
 // Cria a lista se ela não existir.
-// trava a lista antes de logar para garantir consistência (primeiro altera memória, depois log, para não gravar operação errada)
+// trava a lista antes de logar para garantir consistência
 func (rl *RemoteList) Append(args AppendArgs, reply *AppendReply) error {
 	ml := rl.getOrCreateList(args.ListID) //busca ou cria a lista
 
 	// Bloqueia apenas esta lista específica para escrita
 	ml.mu.Lock()
-	ml.Data = append(ml.Data, args.Value)
-	// Loga a operação *antes* de liberar o lock, para consistência.
-	// O log só é escrito se a operação em memória for bem-sucedida.
-	err := rl.logOperation("APPEND", args.ListID, &args.Value)
-	ml.mu.Unlock()
+	defer ml.mu.Unlock()
 
+	// 1. WAL (Write-Ahead Log): Tenta persistir no disco antes de tudo.
+	// Se der erro aqui (disco cheio, falha de I/O), retorna o erro.
+	// Como não tocou na memória ainda, o estado do servidor continua consistente.
+	err := rl.logOperation("APPEND", args.ListID, &args.Value)
 	if err != nil {
-		// Se o log falhar, a operação deve ser revertida?
-		// Para simplicidade aqui, apenas reportamos o erro.
-		log.Printf("Erro ao logar APPEND: %v", err)
-		return fmt.Errorf("operação em memória concluída, mas falha ao logar: %w", err)
+		log.Printf("Erro crítico de persistência (Append): %v", err)
+		return fmt.Errorf("falha ao gravar no disco (WAL): %w", err)
 	}
+
+	// 2. Memória: O disco confirmou a gravação. Agora é seguro alterar a RAM.
+	ml.Data = append(ml.Data, args.Value)
 
 	reply.Success = true
 	return nil
@@ -164,16 +165,20 @@ func (rl *RemoteList) Remove(args RemoveArgs, reply *RemoveReply) error {
 		return errors.New("lista vazia")
 	}
 
+	// 1. Preparação: Descobre o valor e índice, mas NÃO remove ainda.
 	lastIndex := len(ml.Data) - 1
-	reply.Value = ml.Data[lastIndex]
-	ml.Data = ml.Data[:lastIndex]
+	valueToRemove := ml.Data[lastIndex]
 
-	// Loga a operação
+	// 2. WAL: Registra a intenção de remover no disco.
 	err := rl.logOperation("REMOVE", args.ListID, nil)
 	if err != nil {
-		log.Printf("Erro ao logar REMOVE: %v", err)
-		return fmt.Errorf("operação em memória concluída, mas falha ao logar: %w", err)
+		log.Printf("Erro crítico de persistência (Remove): %v", err)
+		return fmt.Errorf("falha ao gravar no disco (WAL): %w", err)
 	}
+
+	// 3. Memória: O disco confirmou. Agora podemos cortar o slice na RAM.
+	ml.Data = ml.Data[:lastIndex]
+	reply.Value = valueToRemove
 
 	return nil
 }
