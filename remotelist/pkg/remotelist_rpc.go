@@ -87,7 +87,7 @@ func NewRemoteList() *RemoteList {
 		log.Printf("Erro ao carregar dados do disco: %v. Começando com estado vazio.", err)
 		// Garante que o logFile seja criado mesmo se o load falhar
 		if rl.logFile == nil {
-			f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 			if err != nil {
 				// Se não podemos escrever o log, é um erro fatal.
 				log.Fatalf("FATAL: Não foi possível abrir o arquivo de log: %v", err)
@@ -281,95 +281,91 @@ func (rl *RemoteList) snapshotScheduler() {
 // createSnapshot salva o estado atual de todas as listas em um arquivo
 // e limpa o arquivo de log de forma atômica em relação aos dados copiados.
 func (rl *RemoteList) createSnapshot() error {
-    // --- FASE 1: Preparação (Coletar referências) ---
-    
-    // Pega a lista de IDs e Ponteiros (protegido pelo mapMu)
-    rl.mapMu.RLock()
-    listIDs := make([]string, 0, len(rl.lists))
-    listsToLock := make([]*ManagedList, 0, len(rl.lists))
-    for id, ml := range rl.lists {
-        listIDs = append(listIDs, id)
-        listsToLock = append(listsToLock, ml)
-    }
-    rl.mapMu.RUnlock() // Libera o map para que novas listas possam ser criadas (se necessário)
+	// --- FASE 1: Preparação (Coletar referências) ---
 
-    // --- FASE 2: Região Crítica (Cópia e Limpeza do Log) ---
+	rl.mapMu.RLock()
+	listIDs := make([]string, 0, len(rl.lists))
+	listsToLock := make([]*ManagedList, 0, len(rl.lists))
+	for id, ml := range rl.lists {
+		listIDs = append(listIDs, id)
+		listsToLock = append(listsToLock, ml)
+	}
+	rl.mapMu.RUnlock()
 
-    // 1. Bloqueia o Log PRIMEIRO (Write Lock).
-    // impede que qualquer Append/Remove escreva no log
-    rl.logLock.Lock()
-    defer rl.logLock.Unlock()
+	// --- FASE 2: Região Crítica (Cópia e Limpeza do Log) ---
 
-    // 2. Bloqueia todas as listas em memória para Leitura.
-    // Isso congela o estado das listas.
-    for _, ml := range listsToLock {
-        ml.mu.RLock()
-    }
+	rl.logLock.Lock()
+	defer rl.logLock.Unlock()
 
-    // Função auxiliar para desbloquear listas (usada em caso de erro ou sucesso)
-    unlockLists := func() {
-        for _, ml := range listsToLock {
-            ml.mu.RUnlock()
-        }
-    }
+	for _, ml := range listsToLock {
+		ml.mu.RLock()
+	}
 
-    // 3. Copia os dados da memória para uma estrutura temporária.
-    snapshotData := make(map[string][]int)
-    for i, ml := range listsToLock {
-        id := listIDs[i]
-        // Faz uma cópia profunda (Deep Copy) do slice de dados
-        dataCopy := make([]int, len(ml.Data))
-        copy(dataCopy, ml.Data)
-        snapshotData[id] = dataCopy
-    }
+	unlockLists := func() {
+		for _, ml := range listsToLock {
+			ml.mu.RUnlock()
+		}
+	}
 
-    // 4. PONTO DE CORTE: Truncar o Log.
-    // Fazer isso AGORA, enquanto as listas ainda estão bloqueadas e copiadas.
-    // Garantia: O que está em 'snapshotData' é exatamente o estado "zero" do novo log.
-    if err := rl.logFile.Truncate(0); err != nil {
-        unlockLists() // Libera as listas antes de retornar erro
-        return fmt.Errorf("falha ao truncar log: %w", err)
-    }
-    // Reposiciona o ponteiro do arquivo para o início
-    if _, err := rl.logFile.Seek(0, 0); err != nil {
-        unlockLists()
-        return fmt.Errorf("falha ao resetar ponteiro do log: %w", err)
-    }
+	snapshotData := make(map[string][]int)
+	for i, ml := range listsToLock {
+		id := listIDs[i]
+		dataCopy := make([]int, len(ml.Data))
+		copy(dataCopy, ml.Data)
+		snapshotData[id] = dataCopy
+	}
 
-    // 5. Libera os bloqueios das listas.
-    // A partir de agora, os clientes podem voltar a fazer Append/Remove.
-    // Como o log foi zerado e o lock do log será liberado no defer, 
-    // as novas operações escreverão corretamente no início do arquivo de log vazio.
-    unlockLists()
+	// --- CORREÇÃO PARA WINDOWS AQUI ---
+	
+	// 1. Fecha o arquivo atual (pois o Windows bloqueia Truncate em arquivo O_APPEND)
+	rl.logFile.Close()
 
-    // --- FASE 3: Persistência (IO Pesado - Sem Locks de Lista) ---
-    // Aqui não travamos mais os clientes. Apenas salvamos o 'snapshotData' no disco.
+	// 2. Trunca (zera) o arquivo diretamente pelo caminho no disco
+	if err := os.Truncate(logFile, 0); err != nil {
+		unlockLists()
+		// Tenta reabrir para não quebrar o servidor totalmente
+		f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+		rl.logFile = f
+		return fmt.Errorf("falha ao truncar log: %w", err)
+	}
 
-    tempFile := snapshotFile + ".tmp"
-    file, err := os.Create(tempFile)
-    if err != nil {
-        return fmt.Errorf("falha ao criar arquivo temp de snapshot: %w", err)
-    }
-    
-    encoder := json.NewEncoder(file)
+	// 3. Reabre o arquivo limpo para as próximas operações
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		unlockLists()
+		return fmt.Errorf("falha ao reabrir log após truncate: %w", err)
+	}
+	rl.logFile = f
+
+	// --- FIM DA CORREÇÃO ---
+
+	unlockLists()
+
+	// --- FASE 3: Persistência (IO Pesado - Sem Locks de Lista) ---
+
+	tempFile := snapshotFile + ".tmp"
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("falha ao criar arquivo temp de snapshot: %w", err)
+	}
+
+	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
-    if err := encoder.Encode(snapshotData); err != nil {
-        file.Close()
-        os.Remove(tempFile) // Limpa o arquivo corrompido/incompleto
-        return fmt.Errorf("falha ao serializar (json) snapshot: %w", err)
-    }
-    
-    // Fecha o arquivo para garantir flush dos dados no disco
-    if err := file.Close(); err != nil {
-         return fmt.Errorf("falha ao fechar arquivo temp: %w", err)
-    }
+	if err := encoder.Encode(snapshotData); err != nil {
+		file.Close()
+		os.Remove(tempFile)
+		return fmt.Errorf("falha ao serializar (json) snapshot: %w", err)
+	}
 
-    // 6. Substituição Atômica do arquivo antigo pelo novo
-    if err := os.Rename(tempFile, snapshotFile); err != nil {
-        return fmt.Errorf("falha ao renomear snapshot final: %w", err)
-    }
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("falha ao fechar arquivo temp: %w", err)
+	}
 
-    return nil
+	if err := os.Rename(tempFile, snapshotFile); err != nil {
+		return fmt.Errorf("falha ao renomear snapshot final: %w", err)
+	}
+
+	return nil
 }
 
 // loadFromDisk restaura o estado do serviço a partir dos arquivos.
