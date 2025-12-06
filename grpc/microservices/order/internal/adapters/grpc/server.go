@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
-func (a Adapter) Create (ctx context.Context, request * order.CreateOrderRequest) (*order.CreateOrderResponse, error) {
+func (a Adapter) Create (ctx context.Context, request *order.CreateOrderRequest) (*order.CreateOrderResponse, error) {
 	// 1. Tradução (Mapping): De Proto para Domínio
 	var orderItems []domain.OrderItem
 	for _, orderItem := range request.OrderItems {
